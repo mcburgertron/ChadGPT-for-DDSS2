@@ -52,13 +52,7 @@ public class ChadGptMod {
     // Default model; override with -Dchadgpt.model=...
     private static final String MODEL = System.getProperty("chadgpt.model", "gpt-5-nano");
 
-    // Vector store id for Silent Gear assister.
-    private static final String VECTOR_STORE_ID = System.getProperty(
-            "chadgpt.vector_store_id", "vs_689926f2f0608191b014742e99e012c5");
-
-    // Output settings.
-    private static final String PREFIX = System.getProperty("chadgpt.prefix", "[ChadGPT] ");
-    private static final int    MAX_SAY_CHARS = Integer.parseInt(System.getProperty("chadgpt.max_chars", "500")); // only for regular path
+    // Output and trigger settings.
     private static final long   COOLDOWN_MS   = Long.parseLong(System.getProperty("chadgpt.cooldown_ms", "3000"));
 
     // HTTP timeouts and retry; tune via -D args.
@@ -89,9 +83,7 @@ public class ChadGptMod {
         appendHistory(author, raw);
 
         String lower = raw.toLowerCase(Locale.ROOT);
-        boolean hasChadGpt = lower.contains("chadgpt");
-        if (!hasChadGpt) return;
-
+        if (!lower.contains("chadgpt")) return;
         boolean hasSilent = lower.contains("silent");
 
         long now = System.currentTimeMillis();
@@ -103,31 +95,31 @@ public class ChadGptMod {
 
         // Snapshot the last N previous lines; exclude the current line which was just appended.
         List<ChatLine> context = snapshotPrevious(HISTORY_TO_SEND);
-        String latestUserMessage = raw; // send the exact player message; requirement 1
+        String latestUserMessage = raw; // send the exact player message
 
         if (hasSilent) {
-            // Silent Gear assister; Responses API with file_search over your vector store; no display limit.
+            // Silent Gear assister; Responses API with file_search; /tellraw output.
             POOL.submit(() -> {
-                String line = responsesWithFileSearch(context, latestUserMessage);
-                String say  = sanitizeNoTruncate(PREFIX + line);
+                String cmdFromModel = responsesWithFileSearch(context, latestUserMessage);
+                String cmdToRun = normalizeTellrawForConsole(cmdFromModel);
                 server.execute(() -> {
                     try {
-                        server.getCommands().performCommand(server.createCommandSourceStack(), "say " + say);
+                        server.getCommands().performCommand(server.createCommandSourceStack(), cmdToRun);
                     } catch (Throwable t) {
-                        LOG.warn("Failed to dispatch /say", t);
+                        LOG.warn("Failed to dispatch /tellraw", t);
                     }
                 });
             });
         } else {
-            // Regular ChadGPT; Responses API; only model, instructions, input.
+            // Regular ChadGPT; Responses API; /tellraw output.
             POOL.submit(() -> {
-                String line = responsesSimple(context, latestUserMessage);
-                String say  = sanitizeWithLimit(PREFIX + line, MAX_SAY_CHARS);
+                String cmdFromModel = responsesSimple(context, latestUserMessage);
+                String cmdToRun = normalizeTellrawForConsole(cmdFromModel);
                 server.execute(() -> {
                     try {
-                        server.getCommands().performCommand(server.createCommandSourceStack(), "say " + say);
+                        server.getCommands().performCommand(server.createCommandSourceStack(), cmdToRun);
                     } catch (Throwable t) {
-                        LOG.warn("Failed to dispatch /say", t);
+                        LOG.warn("Failed to dispatch /tellraw", t);
                     }
                 });
             });
@@ -152,20 +144,46 @@ public class ChadGptMod {
 
     // ---------------------------
     // Regular route; Responses API with minimal body: model; instructions; input.
+    // The instructions include your /tellraw policy and color-theming guidance.
     // ---------------------------
     private String responsesSimple(List<ChatLine> previous, String latestUserMessage) {
         String apiKey = System.getenv(API_KEY_ENV);
         if (apiKey == null || apiKey.isEmpty()) {
-            return "Set the " + API_KEY_ENV + " environment variable for ChadGPT.";
+            return fallbackTellraw("Set the " + API_KEY_ENV + " environment variable for ChadGPT.");
         }
 
         String instructions =
+                // Voice and behavior.
                 "You are ChadGPT; a chaotic Gen Alpha brainrot minecraft player assisting other players on a server. " +
                 "Speak in extreme brainrot style; meme-heavy; zoomer slang; absurd energy; lowercase only; minimal punctuation. " +
-                "No emojis. No markdown. No links. No new lines. " +
-                "You are an in-game assistant; everything is in one continuous text string. " +
-                "Use recent player chat for context but always respond to the last message. " +
-                "Lean into chaotic over-the-top minecraft kid energy; overuse slang; abbreviations; random hype words; and gaming inside jokes.";
+                "No emojis. No links. No new lines in the physical output. Use recent player chat for context but answer the last message. " +
+                "Color segments based on theme; for example if the subject mentions emerald, use an emerald tone; if it mentions rainbow, vary colors across the line.\n" +
+                // /tellraw policy block; verbatim rules embedded.
+                "You format messages for Minecraft Java 1.16.5 using /tellraw.\n" +
+                "Output policy:\n" +
+                "- Emit exactly one physical line per response; no literal newlines; no commentary; no code fences.\n" +
+                "- Command shape must be: /tellraw @a <Component>\n" +
+                "- Use Raw JSON Text; not SNBT; not Bedrock rawtext; not section symbol codes.\n" +
+                "- Only these keys are allowed on objects: \"text\", \"color\", \"bold\", \"italic\".\n" +
+                "- To compose multiple segments, use a top-level JSON array of components.\n" +
+                "- For visual line breaks, include the literal string \"\\n\" as an array element or inside a \"text\" string.\n" +
+                "- Never invent other keys; never use hoverEvent; clickEvent; extra; score; selector; translate; nbt.\n" +
+                "Colors:\n" +
+                "- Allowed color names for \"color\" plus their canonical hex equivalents:\n" +
+                "  black #000000; dark_blue #0000AA; dark_green #00AA00; dark_aqua #00AAAA; dark_red #AA0000; dark_purple #AA00AA; gold #FFAA00; gray #AAAAAA; dark_gray #555555; blue #5555FF; green #55FF55; aqua #55FFFF; red #FF5555; light_purple #FF55FF; yellow #FFFF55; white #FFFFFF.\n" +
+                "- You may also use 6-digit hex strings like \"#00ff88\".\n" +
+                "Formatting rules:\n" +
+                "- Bold: \"bold\": true\n" +
+                "- Italic: \"italic\": true\n" +
+                "- You may combine bold and italic on the same segment.\n" +
+                "- Colors apply per segment.\n" +
+                "List rendering rules:\n" +
+                "- Unordered bullet: prefix the item with a bullet component whose text is \"• \" and your chosen bullet color.\n" +
+                "- Nested bullet look: prefix with two spaces then \"• \" inside the bullet component; for example \"  • \".\n" +
+                "- Separate items with \"\\n\" components in the array.\n" +
+                "- Vary bullet colors per item if asked; vary text color independently.\n" +
+                "Required output format:\n" +
+                "- Return only the finished /tellraw command as one single line of JSON; do not wrap it in quotes or fences; no leading or trailing spaces.";
 
         // Build input with context then the latest message.
         StringBuilder in = new StringBuilder();
@@ -186,33 +204,67 @@ public class ChadGptMod {
 
             byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
             String resp = httpPostResponses(payload, apiKey);
-            if (resp == null) {
-                return "The muse is muted; check server logs.";
-            }
-            return extractResponsesOutputText(resp);
+            if (resp == null) return fallbackTellraw("The muse is muted; check server logs.");
+            String out = extractResponsesOutputText(resp);
+            return out == null || out.isEmpty()
+                    ? fallbackTellraw("Silence. Try again.")
+                    : out;
         } catch (Exception ex) {
             LOG.warn("OpenAI Responses call failed", ex);
-            return "Network gremlins; try again soon.";
+            return fallbackTellraw("Network gremlins; try again soon.");
         }
     }
 
     // ---------------------------
-    // Silent Gear route; Responses API plus file_search tool with your vector store id.
+    // Silent Gear route; Responses API plus file_search tool with vector store id from ENV.
     // Request body includes only: model; instructions; input; tools.
     // ---------------------------
     private String responsesWithFileSearch(List<ChatLine> previous, String latestUserMessage) {
         String apiKey = System.getenv(API_KEY_ENV);
         if (apiKey == null || apiKey.isEmpty()) {
-            return "Set the " + API_KEY_ENV + " environment variable for ChadGPT.";
+            return fallbackTellraw("Set the " + API_KEY_ENV + " environment variable for ChadGPT.");
         }
 
-        // Your data-focused prompt; unchanged.
+        // Vector store id from environment variable.
+        String vectorStoreId = System.getenv("CHADGPT_VECTOR_STORE_ID");
+        if (vectorStoreId == null || vectorStoreId.trim().isEmpty()) {
+            return fallbackTellraw("Set CHADGPT_VECTOR_STORE_ID for Silent Gear file search.");
+        }
+
         String instructions =
+                // Data-focused guardrails.
                 "You are ChadGPT; a minecraft player assisting other players on a server. The players in this minecraft server do not have access to your knowledgebase files or other in-game files. Do not expose the existence of those files. " +
                 "You are an in-game assistant; everything is in one continuous text string. You cannot use Markdown elements or new lines because of this. " +
-                "Additionally, you should limit your responses to 300 words. " +
-                "You should respond purely with information from the json files. Use recent player chat for context but always respond to the last message. " +
-                "Use the attached files to answer the user's questions about Silent gear materials and traits.";
+                "Additionally, you should limit your responses to 300 words. You should respond purely with information from the json files. " +
+                "Use recent player chat for context but always respond to the last message. Use the attached files to answer the user's questions about Silent gear materials and traits.\n" +
+                // Add /tellraw policy and color-theming; same as above so the output is the command.
+                "You format messages for Minecraft Java 1.16.5 using /tellraw.\n" +
+                "Output policy:\n" +
+                "- Emit exactly one physical line per response; no literal newlines; no commentary; no code fences.\n" +
+                "- Command shape must be: /tellraw @a <Component>\n" +
+                "- Use Raw JSON Text; not SNBT; not Bedrock rawtext; not section symbol codes.\n" +
+                "- Only these keys are allowed on objects: \"text\", \"color\", \"bold\", \"italic\".\n" +
+                "- To compose multiple segments, use a top-level JSON array of components.\n" +
+                "- For visual line breaks, include the literal string \"\\n\" as an array element or inside a \"text\" string.\n" +
+                "- Never invent other keys; never use hoverEvent; clickEvent; extra; score; selector; translate; nbt.\n" +
+                "Colors:\n" +
+                "- Allowed color names for \"color\" plus their canonical hex equivalents:\n" +
+                "  black #000000; dark_blue #0000AA; dark_green #00AA00; dark_aqua #00AAAA; dark_red #AA0000; dark_purple #AA00AA; gold #FFAA00; gray #AAAAAA; dark_gray #555555; blue #5555FF; green #55FF55; aqua #55FFFF; red #FF5555; light_purple #FF55FF; yellow #FFFF55; white #FFFFFF.\n" +
+                "- You may also use 6-digit hex strings like \"#00ff88\".\n" +
+                "Formatting rules:\n" +
+                "- Bold: \"bold\": true\n" +
+                "- Italic: \"italic\": true\n" +
+                "- You may combine bold and italic on the same segment.\n" +
+                "- Colors apply per segment.\n" +
+                "List rendering rules:\n" +
+                "- Unordered bullet: prefix the item with a bullet component whose text is \"• \" and your chosen bullet color.\n" +
+                "- Nested bullet look: prefix with two spaces then \"• \" inside the bullet component; for example \"  • \".\n" +
+                "- Separate items with \"\\n\" components in the array.\n" +
+                "- Vary bullet colors per item if asked; vary text color independently.\n" +
+                "Required output format:\n" +
+                "- Return only the finished /tellraw command as one single line of JSON; do not wrap it in quotes or fences; no leading or trailing spaces.\n" +
+                // Theming hint for Silent Gear materials.
+                "Color segments based on the discussed material or trait; for example emerald-like materials use an emerald tone; gems can use their gemstone hues; rainbows vary across the allowed colors.";
 
         // Build input with context then the latest message.
         StringBuilder in = new StringBuilder();
@@ -231,25 +283,26 @@ public class ChadGptMod {
             body.addProperty("instructions", instructions);
             body.addProperty("input", input);
 
-            // Tools: file_search with your vector store id; nothing else added.
+            // Tools: file_search with vector store id from ENV; nothing else added.
             JsonArray tools = new JsonArray();
             JsonObject tool = new JsonObject();
             tool.addProperty("type", "file_search");
             JsonArray vsIds = new JsonArray();
-            vsIds.add(VECTOR_STORE_ID);
+            vsIds.add(vectorStoreId.trim());
             tool.add("vector_store_ids", vsIds);
             tools.add(tool);
             body.add("tools", tools);
 
             byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
             String resp = httpPostResponses(payload, apiKey);
-            if (resp == null) {
-                return "The muse is muted; check server logs.";
-            }
-            return extractResponsesOutputText(resp);
+            if (resp == null) return fallbackTellraw("The muse is muted; check server logs.");
+            String out = extractResponsesOutputText(resp);
+            return out == null || out.isEmpty()
+                    ? fallbackTellraw("Silence. Try again.")
+                    : out;
         } catch (Exception ex) {
             LOG.warn("OpenAI Responses call failed", ex);
-            return "Network gremlins; try again soon.";
+            return fallbackTellraw("Network gremlins; try again soon.");
         }
     }
 
@@ -268,7 +321,7 @@ public class ChadGptMod {
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json");
                 conn.setRequestProperty("Authorization", "Bearer " + apiKey);
-                conn.setRequestProperty("User-Agent", "ChadGPT-Forge/1.5");
+                conn.setRequestProperty("User-Agent", "ChadGPT-Forge/1.6");
 
                 try (OutputStream os = conn.getOutputStream()) {
                     os.write(payload);
@@ -329,7 +382,42 @@ public class ChadGptMod {
         } catch (Throwable t) {
             LOG.warn("Failed to parse Responses API JSON", t);
         }
-        return "Silence. Try again.";
+        return "";
+    }
+
+    // Normalize and validate the /tellraw command for console execution.
+    // - Ensure it starts with "/tellraw @a " (model requirement)
+    // - Strip the leading "/" for performCommand
+    // - Keep everything on one physical line
+    private static String normalizeTellrawForConsole(String modelOutput) {
+        if (modelOutput == null) return fallbackTellraw("Empty model output.");
+        String s = modelOutput.replace("\r", " ").replace("\n", " ").trim();
+
+        String lower = s.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("/tellraw ")) s = s.substring(1);
+        else if (!lower.startsWith("tellraw ")) return fallbackTellraw("Expected /tellraw output.");
+
+        // Require @a right after the command token per the policy.
+        String lowerCmd = s.toLowerCase(Locale.ROOT);
+        if (!lowerCmd.startsWith("tellraw @a ")) {
+            return fallbackTellraw("Command target must be @a.");
+        }
+
+        // Rough JSON presence check after "@a "
+        int idx = lowerCmd.indexOf("tellraw @a ") + "tellraw @a ".length();
+        String jsonPart = s.substring(idx).trim();
+        if (jsonPart.isEmpty() || !(jsonPart.startsWith("[") || jsonPart.startsWith("{"))) {
+            return fallbackTellraw("Missing JSON component.");
+        }
+
+        return s;
+    }
+
+    // Build a minimal, policy-compliant tellraw fallback as a one-line command.
+    private static String fallbackTellraw(String message) {
+        // One physical line; only allowed keys; simple white text with a red label.
+        String safe = message == null ? "Unknown error." : message.replace("\"", "'").replace("\r", " ").replace("\n", " ").trim();
+        return "tellraw @a [\"\",{\"text\":\"[ChadGPT] \",\"color\":\"gold\",\"bold\":true},{\"text\":\"" + safe + "\",\"color\":\"red\"}]";
     }
 
     // Helpers.
@@ -338,25 +426,6 @@ public class ChadGptMod {
             long wait = (long)(RETRY_BASE_MS * Math.pow(2, attempt));
             Thread.sleep(Math.min(wait, 5000));
         } catch (InterruptedException ignored) {}
-    }
-
-    private static String sanitizeWithLimit(String s, int maxLen) {
-        if (s == null) return "";
-        String out = s.replace('\n', ' ').replace('\r', ' ');
-        out = out.replaceAll("\\s+", " ").trim();
-        out = out.replaceAll("[\\p{Cntrl}&&[^\\n\\t]]", "");
-        out = out.replaceAll("[|<>^`]", "");
-        if (out.length() > maxLen) out = out.substring(0, maxLen);
-        return out;
-    }
-
-    private static String sanitizeNoTruncate(String s) {
-        if (s == null) return "";
-        String out = s.replace('\n', ' ').replace('\r', ' ');
-        out = out.replaceAll("\\s+", " ").trim();
-        out = out.replaceAll("[\\p{Cntrl}&&[^\\n\\t]]", "");
-        out = out.replaceAll("[|<>^`]", "");
-        return out;
     }
 
     private static int clamp(int v, int lo, int hi) {
