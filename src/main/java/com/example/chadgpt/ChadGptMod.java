@@ -2,8 +2,10 @@ package com.example.chadgpt;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
 import com.google.gson.JsonPrimitive;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.MinecraftForge;
@@ -486,7 +488,7 @@ public class ChadGptMod {
         }
         if (comp.isJsonArray()) return comp.getAsJsonArray();
         JsonArray arr = new JsonArray();
-        arr.add(comp.deepCopy());
+        arr.add(deepCopy(comp));
         return arr;
     }
 
@@ -534,7 +536,7 @@ public class ChadGptMod {
                     }
                 } else {
                     // Object without text; keep as-is.
-                    current.add(obj.deepCopy());
+                    current.add(deepCopy(obj));
                 }
                 continue;
             }
@@ -585,7 +587,38 @@ public class ChadGptMod {
         }
 
         for (JsonElement e : line) {
-            out.add(e.deepCopy());
+            out.add(deepCopy(e));
+
+    }
+
+    // Gson's JsonElement#deepCopy is not public in many versions; provide our own.
+    private static JsonElement deepCopy(JsonElement element) {
+        if (element == null || element.isJsonNull()) {
+            return JsonNull.INSTANCE;
+        }
+        if (element.isJsonPrimitive()) {
+            JsonPrimitive p = element.getAsJsonPrimitive();
+            if (p.isString()) return new JsonPrimitive(p.getAsString());
+            if (p.isBoolean()) return new JsonPrimitive(p.getAsBoolean());
+            if (p.isNumber()) return new JsonPrimitive(p.getAsNumber());
+            // Fallback to string representation
+            return new JsonPrimitive(p.getAsString());
+        }
+        if (element.isJsonArray()) {
+            JsonArray in = element.getAsJsonArray();
+            JsonArray out = new JsonArray();
+            for (JsonElement e : in) {
+                out.add(deepCopy(e));
+            }
+            return out;
+        }
+        // JsonObject
+        JsonObject inObj = element.getAsJsonObject();
+        JsonObject outObj = new JsonObject();
+        for (var entry : inObj.entrySet()) {
+            outObj.add(entry.getKey(), deepCopy(entry.getValue()));
+        }
+        return outObj;
         }
         return out;
     }
