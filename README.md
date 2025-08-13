@@ -64,6 +64,23 @@ If the model ever returns something that is not a valid `/tellraw @a .` line, th
 
   The jar appears in `build\libs\`.
 
+## Build Environment (Windows reference)
+
+Use this as the canonical baseline for building and testing.
+
+- OS: Windows 11 Pro 10.0.22631 (64-bit)
+- Gradle: 8.4
+- Java: Temurin JRE 21.0.8 for Gradle runtime; target Java 8 for compilation
+- Minecraft/Forge: 1.16.5 / 36.2.42; mappings: official 1.16.5
+- Tooling: `org.gradle.java.home` points to a local JDK 8 installation (see `gradle.properties`)
+- Verified commit: d3e138f (2025-08-12)
+
+Build command:
+
+```powershell
+.\gradlew.bat clean build
+```
+
 ## Triggers; examples
 
 * Regular route:
@@ -149,4 +166,3 @@ MIT; see `mods.toml`.
 ## Credits
 
 Chat prompts and vector store by you; code scaffolding by ChadGPT; Minecraft is a trademark of Mojang Studios.
-
