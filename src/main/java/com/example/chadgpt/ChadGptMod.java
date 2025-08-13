@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
 import net.minecraft.server.MinecraftServer;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.ServerChatEvent;
@@ -26,6 +27,7 @@ import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 
 @Mod("chadgpt")
 public class ChadGptMod {
@@ -52,14 +54,18 @@ public class ChadGptMod {
     // Default model; override with -Dchadgpt.model=...
     private static final String MODEL = System.getProperty("chadgpt.model", "gpt-5-nano");
 
-    // Output and trigger settings.
-    private static final long   COOLDOWN_MS   = Long.parseLong(System.getProperty("chadgpt.cooldown_ms", "3000"));
-
     // HTTP timeouts and retry; tune via -D args.
     private static final int RESP_CONNECT_MS = Integer.parseInt(System.getProperty("chadgpt.responses_connect_ms", "20000"));
     private static final int RESP_READ_MS    = Integer.parseInt(System.getProperty("chadgpt.responses_read_ms",    "120000"));
     private static final int HTTP_RETRIES    = Integer.parseInt(System.getProperty("chadgpt.http_retries", "2"));
     private static final int RETRY_BASE_MS   = Integer.parseInt(System.getProperty("chadgpt.retry_base_ms", "750"));
+
+    // Cooldown between triggers; shared by both routes.
+    private static final long COOLDOWN_MS = Long.parseLong(System.getProperty("chadgpt.cooldown_ms", "3000"));
+
+    // Follow-up window; if >0 and a player says a line containing the word "you", regular ChadGPT replies.
+    private int followWindowRemaining = 0;
+    private static final Pattern YOU_WORD = Pattern.compile("(?i)(^|\\W)you(\\W|$)");
 
     private final AtomicLong lastCallMs = new AtomicLong(0);
 
@@ -83,46 +89,68 @@ public class ChadGptMod {
         appendHistory(author, raw);
 
         String lower = raw.toLowerCase(Locale.ROOT);
-        if (!lower.contains("chadgpt")) return;
-        boolean hasSilent = lower.contains("silent");
+        boolean explicitHasChadGpt = lower.contains("chadgpt");
+        boolean explicitHasSilent  = explicitHasChadGpt && lower.contains("silent");
+
+        boolean followupYou = !explicitHasChadGpt
+                && followWindowRemaining > 0
+                && YOU_WORD.matcher(lower).find();
+
+        boolean shouldTrigger = explicitHasChadGpt || followupYou;
 
         long now = System.currentTimeMillis();
-        if (now - lastCallMs.get() < COOLDOWN_MS) return;
-        lastCallMs.set(now);
-
+        boolean cooldownOk = now - lastCallMs.get() >= COOLDOWN_MS;
         MinecraftServer server = event.getPlayer() != null ? event.getPlayer().getServer() : null;
         if (server == null) return;
 
-        // Snapshot the last N previous lines; exclude the current line which was just appended.
-        List<ChatLine> context = snapshotPrevious(HISTORY_TO_SEND);
-        String latestUserMessage = raw; // send the exact player message
+        if (shouldTrigger && cooldownOk) {
+            lastCallMs.set(now);
 
-        if (hasSilent) {
-            // Silent Gear assister; Responses API with file_search; /tellraw output.
-            POOL.submit(() -> {
-                String cmdFromModel = responsesWithFileSearch(context, latestUserMessage);
-                String cmdToRun = normalizeTellrawForConsole(cmdFromModel);
-                server.execute(() -> {
-                    try {
-                        server.getCommands().performCommand(server.createCommandSourceStack(), cmdToRun);
-                    } catch (Throwable t) {
-                        LOG.warn("Failed to dispatch /tellraw", t);
-                    }
-                });
+            // Ack; immediate; one clean line.
+            String ackCmd = buildAckTellraw("Message received.");
+            server.execute(() -> {
+                server.getCommands().performCommand(server.createCommandSourceStack(), ackCmd);
+                LOG.info("[ChadGPT ack] Message received.");
             });
-        } else {
-            // Regular ChadGPT; Responses API; /tellraw output.
-            POOL.submit(() -> {
-                String cmdFromModel = responsesSimple(context, latestUserMessage);
-                String cmdToRun = normalizeTellrawForConsole(cmdFromModel);
-                server.execute(() -> {
-                    try {
-                        server.getCommands().performCommand(server.createCommandSourceStack(), cmdToRun);
-                    } catch (Throwable t) {
-                        LOG.warn("Failed to dispatch /tellraw", t);
-                    }
+
+            // Snapshot the last N previous lines; exclude the current line which was just appended.
+            List<ChatLine> context = snapshotPrevious(HISTORY_TO_SEND);
+            String latestUserMessage = raw; // send the exact player message
+
+            if (explicitHasSilent) {
+                // Silent Gear assister; Responses API with file_search; /tellraw output.
+                POOL.submit(() -> {
+                    String cmdFromModel = responsesWithFileSearch(context, latestUserMessage);
+                    // Build one or more tellraw commands; inject identifier; split on "\n"
+                    List<String> cmds = buildTellrawCommandsWithIdentifier(cmdFromModel);
+                    server.execute(() -> {
+                        for (String c : cmds) {
+                            server.getCommands().performCommand(server.createCommandSourceStack(), c);
+                            LOG.info("[ChadGPT out] " + extractPlainTextFromCommand(c));
+                        }
+                        // Start a new two-message follow-up window after the final response is sent.
+                        followWindowRemaining = 2;
+                    });
                 });
-            });
+            } else {
+                // Regular ChadGPT; Responses API; /tellraw output.
+                POOL.submit(() -> {
+                    String cmdFromModel = responsesSimple(context, latestUserMessage);
+                    List<String> cmds = buildTellrawCommandsWithIdentifier(cmdFromModel);
+                    server.execute(() -> {
+                        for (String c : cmds) {
+                            server.getCommands().performCommand(server.createCommandSourceStack(), c);
+                            LOG.info("[ChadGPT out] " + extractPlainTextFromCommand(c));
+                        }
+                        followWindowRemaining = 2;
+                    });
+                });
+            }
+        }
+
+        // Count down any existing follow-up window on every player chat line.
+        if (followWindowRemaining > 0) {
+            followWindowRemaining--;
         }
     }
 
@@ -144,7 +172,7 @@ public class ChadGptMod {
 
     // ---------------------------
     // Regular route; Responses API with minimal body: model; instructions; input.
-    // The instructions include your /tellraw policy and color-theming guidance.
+    // Includes your tellraw policy; colors themed by content.
     // ---------------------------
     private String responsesSimple(List<ChatLine> previous, String latestUserMessage) {
         String apiKey = System.getenv(API_KEY_ENV);
@@ -237,7 +265,7 @@ public class ChadGptMod {
                 "You are an in-game assistant; everything is in one continuous text string. You cannot use Markdown elements or new lines because of this. " +
                 "Additionally, you should limit your responses to 300 words. You should respond purely with information from the json files. " +
                 "Use recent player chat for context but always respond to the last message. Use the attached files to answer the user's questions about Silent gear materials and traits.\n" +
-                // Add /tellraw policy and color-theming; same as above so the output is the command.
+                // Tellraw policy and theming.
                 "You format messages for Minecraft Java 1.16.5 using /tellraw.\n" +
                 "Output policy:\n" +
                 "- Emit exactly one physical line per response; no literal newlines; no commentary; no code fences.\n" +
@@ -256,15 +284,9 @@ public class ChadGptMod {
                 "- Italic: \"italic\": true\n" +
                 "- You may combine bold and italic on the same segment.\n" +
                 "- Colors apply per segment.\n" +
-                "List rendering rules:\n" +
-                "- Unordered bullet: prefix the item with a bullet component whose text is \"• \" and your chosen bullet color.\n" +
-                "- Nested bullet look: prefix with two spaces then \"• \" inside the bullet component; for example \"  • \".\n" +
-                "- Separate items with \"\\n\" components in the array.\n" +
-                "- Vary bullet colors per item if asked; vary text color independently.\n" +
                 "Required output format:\n" +
                 "- Return only the finished /tellraw command as one single line of JSON; do not wrap it in quotes or fences; no leading or trailing spaces.\n" +
-                // Theming hint for Silent Gear materials.
-                "Color segments based on the discussed material or trait; for example emerald-like materials use an emerald tone; gems can use their gemstone hues; rainbows vary across the allowed colors.";
+                "Color segments based on the discussed material or trait; e.g., emerald-like materials use an emerald tone; gems use gemstone hues; rainbows vary across allowed colors.";
 
         // Build input with context then the latest message.
         StringBuilder in = new StringBuilder();
@@ -321,7 +343,7 @@ public class ChadGptMod {
                 conn.setRequestMethod("POST");
                 conn.setRequestProperty("Content-Type", "application/json");
                 conn.setRequestProperty("Authorization", "Bearer " + apiKey);
-                conn.setRequestProperty("User-Agent", "ChadGPT-Forge/1.6");
+                conn.setRequestProperty("User-Agent", "ChadGPT-Forge/1.7");
 
                 try (OutputStream os = conn.getOutputStream()) {
                     os.write(payload);
@@ -385,39 +407,256 @@ public class ChadGptMod {
         return "";
     }
 
-    // Normalize and validate the /tellraw command for console execution.
-    // - Ensure it starts with "/tellraw @a " (model requirement)
-    // - Strip the leading "/" for performCommand
-    // - Keep everything on one physical line
-    private static String normalizeTellrawForConsole(String modelOutput) {
-        if (modelOutput == null) return fallbackTellraw("Empty model output.");
-        String s = modelOutput.replace("\r", " ").replace("\n", " ").trim();
+    // ----- Tellraw assembly and utilities -----
 
+    // Build ack: tellraw @a ["", {"text":"<ChadGPT> ","color":"gold","bold":true}, {"text":"Message received.","color":"gray"}]
+    private static String buildAckTellraw(String message) {
+        String safe = message == null ? "" : message.replace("\"", "'").replace("\r", " ").replace("\n", " ").trim();
+        JsonArray arr = new JsonArray();
+        arr.add(new JsonPrimitive(""));
+        JsonObject tag = new JsonObject();
+        tag.addProperty("text", "<ChadGPT> ");
+        tag.addProperty("color", "gold");
+        tag.addProperty("bold", true);
+        arr.add(tag);
+        JsonObject msg = new JsonObject();
+        msg.addProperty("text", safe);
+        msg.addProperty("color", "gray");
+        arr.add(msg);
+        return "tellraw @a " + arr.toString();
+    }
+
+    // Turn the model's single-line /tellraw into one or more tellraw commands:
+    // - validate prefix
+    // - parse JSON
+    // - split on "\n"
+    // - inject <ChadGPT> identifier at the start of each line
+    private static List<String> buildTellrawCommandsWithIdentifier(String modelOutput) {
+        List<String> out = new ArrayList<>();
+        if (modelOutput == null) {
+            out.add(fallbackTellraw("Empty model output."));
+            return out;
+        }
+        String s = modelOutput.replace("\r", " ").trim();
         String lower = s.toLowerCase(Locale.ROOT);
-        if (lower.startsWith("/tellraw ")) s = s.substring(1);
-        else if (!lower.startsWith("tellraw ")) return fallbackTellraw("Expected /tellraw output.");
 
-        // Require @a right after the command token per the policy.
+        // Accept with or without leading slash.
+        if (lower.startsWith("/tellraw ")) s = s.substring(1);
+        else if (!lower.startsWith("tellraw ")) {
+            out.add(fallbackTellraw("Expected /tellraw output."));
+            return out;
+        }
+
         String lowerCmd = s.toLowerCase(Locale.ROOT);
         if (!lowerCmd.startsWith("tellraw @a ")) {
-            return fallbackTellraw("Command target must be @a.");
+            out.add(fallbackTellraw("Command target must be @a."));
+            return out;
         }
 
-        // Rough JSON presence check after "@a "
-        int idx = lowerCmd.indexOf("tellraw @a ") + "tellraw @a ".length();
+        int idx = "tellraw @a ".length();
         String jsonPart = s.substring(idx).trim();
-        if (jsonPart.isEmpty() || !(jsonPart.startsWith("[") || jsonPart.startsWith("{"))) {
-            return fallbackTellraw("Missing JSON component.");
+        if (jsonPart.isEmpty()) {
+            out.add(fallbackTellraw("Missing JSON component."));
+            return out;
         }
 
-        return s;
+        try {
+            JsonElement root = new JsonParser().parse(jsonPart);
+            List<JsonArray> lines = splitIntoLines(ensureArrayComponent(root));
+
+            for (JsonArray line : lines) {
+                JsonArray withId = prependIdentifier(line);
+                String cmd = "tellraw @a " + withId.toString();
+                out.add(cmd);
+            }
+            return out;
+        } catch (Throwable t) {
+            LOG.warn("Failed to parse model tellraw JSON; using fallback", t);
+            out.add(fallbackTellraw("Formatting error; try again."));
+            return out;
+        }
+    }
+
+    // If the top-level component is an object, wrap it into an array for uniform processing.
+    private static JsonArray ensureArrayComponent(JsonElement comp) {
+        if (comp == null) {
+            JsonArray arr = new JsonArray();
+            arr.add(new JsonPrimitive(""));
+            return arr;
+        }
+        if (comp.isJsonArray()) return comp.getAsJsonArray();
+        JsonArray arr = new JsonArray();
+        arr.add(comp.deepCopy());
+        return arr;
+    }
+
+    // Split a component array into visual lines on any "\n" boundaries.
+    private static List<JsonArray> splitIntoLines(JsonArray arr) {
+        List<JsonArray> lines = new ArrayList<>();
+        JsonArray current = new JsonArray();
+
+        for (JsonElement el : arr) {
+            if (el == null) continue;
+
+            if (el.isJsonPrimitive() && el.getAsJsonPrimitive().isString()) {
+                String s = el.getAsString();
+                String[] parts = s.split("\\n", -1);
+                for (int i = 0; i < parts.length; i++) {
+                    String part = parts[i];
+                    if (!part.isEmpty()) {
+                        current.add(new JsonPrimitive(part));
+                    }
+                    if (i < parts.length - 1) {
+                        // newline boundary; finalize current
+                        lines.add(current);
+                        current = new JsonArray();
+                    }
+                }
+                continue;
+            }
+
+            if (el.isJsonObject()) {
+                JsonObject obj = el.getAsJsonObject();
+                if (obj.has("text") && obj.get("text").isJsonPrimitive()) {
+                    String text = obj.get("text").getAsString();
+                    String[] parts = text.split("\\n", -1);
+                    for (int i = 0; i < parts.length; i++) {
+                        JsonObject copy = new JsonObject();
+                        copy.addProperty("text", parts[i]);
+                        if (obj.has("color"))  copy.add("color",  obj.get("color"));
+                        if (obj.has("bold"))   copy.add("bold",   obj.get("bold"));
+                        if (obj.has("italic")) copy.add("italic", obj.get("italic"));
+                        if (!parts[i].isEmpty()) current.add(copy);
+                        if (i < parts.length - 1) {
+                            lines.add(current);
+                            current = new JsonArray();
+                        }
+                    }
+                } else {
+                    // Object without text; keep as-is.
+                    current.add(obj.deepCopy());
+                }
+                continue;
+            }
+
+            if (el.isJsonArray()) {
+                // Flatten nested array.
+                List<JsonArray> subLines = splitIntoLines(el.getAsJsonArray());
+                for (int i = 0; i < subLines.size(); i++) {
+                    if (i == 0) {
+                        // append into current
+                        for (JsonElement se : subLines.get(0)) current.add(se);
+                    } else {
+                        lines.add(current);
+                        current = new JsonArray();
+                        for (JsonElement se : subLines.get(i)) current.add(se);
+                    }
+                }
+                continue;
+            }
+        }
+
+        lines.add(current);
+        // Normalize empty lines to at least an empty string component.
+        for (int i = 0; i < lines.size(); i++) {
+            JsonArray ln = lines.get(i);
+            if (ln.size() == 0) {
+                ln.add(new JsonPrimitive(""));
+            }
+        }
+        return lines;
+    }
+
+    // Prepend the <ChadGPT> tag to a line; avoid double-tagging if it is already present.
+    private static JsonArray prependIdentifier(JsonArray line) {
+        // Detect if the line already starts with "<ChadGPT>"
+        String firstText = firstTextOf(line);
+        boolean alreadyTagged = firstText != null && firstText.startsWith("<ChadGPT>");
+
+        JsonArray out = new JsonArray();
+        out.add(new JsonPrimitive("")); // standard anchor
+
+        if (!alreadyTagged) {
+            JsonObject tag = new JsonObject();
+            tag.addProperty("text", "<ChadGPT> ");
+            tag.addProperty("color", "gold");
+            tag.addProperty("bold", true);
+            out.add(tag);
+        }
+
+        for (JsonElement e : line) {
+            out.add(e.deepCopy());
+        }
+        return out;
+    }
+
+    private static String firstTextOf(JsonArray line) {
+        if (line == null) return null;
+        for (JsonElement e : line) {
+            if (e.isJsonPrimitive() && e.getAsJsonPrimitive().isString()) {
+                String s = e.getAsString();
+                if (!s.isEmpty()) return s;
+            }
+            if (e.isJsonObject()) {
+                JsonObject o = e.getAsJsonObject();
+                if (o.has("text")) {
+                    String s = o.get("text").getAsString();
+                    if (s != null && !s.isEmpty()) return s;
+                }
+            }
+        }
+        return null;
+    }
+
+    // Extract a plain-text preview from a tellraw command for logging.
+    private static String extractPlainTextFromCommand(String cmd) {
+        try {
+            String s = cmd.trim();
+            String lower = s.toLowerCase(Locale.ROOT);
+            if (lower.startsWith("/tellraw ")) s = s.substring(1);
+            int idx = s.toLowerCase(Locale.ROOT).indexOf("tellraw @a ");
+            if (idx < 0) return cmd;
+            String json = s.substring(idx + "tellraw @a ".length()).trim();
+            JsonElement root = new JsonParser().parse(json);
+            StringBuilder sb = new StringBuilder();
+            collectText(root, sb);
+            return sb.toString().replaceAll("\\s+", " ").trim();
+        } catch (Throwable t) {
+            return cmd;
+        }
+    }
+
+    private static void collectText(JsonElement el, StringBuilder sb) {
+        if (el == null) return;
+        if (el.isJsonPrimitive() && el.getAsJsonPrimitive().isString()) {
+            sb.append(el.getAsString()).append(' ');
+            return;
+        }
+        if (el.isJsonObject()) {
+            JsonObject o = el.getAsJsonObject();
+            if (o.has("text")) sb.append(o.get("text").getAsString()).append(' ');
+            return;
+        }
+        if (el.isJsonArray()) {
+            for (JsonElement e : el.getAsJsonArray()) collectText(e, sb);
+        }
     }
 
     // Build a minimal, policy-compliant tellraw fallback as a one-line command.
     private static String fallbackTellraw(String message) {
-        // One physical line; only allowed keys; simple white text with a red label.
         String safe = message == null ? "Unknown error." : message.replace("\"", "'").replace("\r", " ").replace("\n", " ").trim();
-        return "tellraw @a [\"\",{\"text\":\"[ChadGPT] \",\"color\":\"gold\",\"bold\":true},{\"text\":\"" + safe + "\",\"color\":\"red\"}]";
+        JsonArray arr = new JsonArray();
+        arr.add(new JsonPrimitive(""));
+        JsonObject tag = new JsonObject();
+        tag.addProperty("text", "<ChadGPT> ");
+        tag.addProperty("color", "gold");
+        tag.addProperty("bold", true);
+        arr.add(tag);
+        JsonObject msg = new JsonObject();
+        msg.addProperty("text", safe);
+        msg.addProperty("color", "red");
+        arr.add(msg);
+        return "tellraw @a " + arr.toString();
     }
 
     // Helpers.
