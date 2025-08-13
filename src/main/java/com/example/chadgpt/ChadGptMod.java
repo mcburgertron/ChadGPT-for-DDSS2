@@ -93,6 +93,7 @@ public class ChadGptMod {
         String lower = raw.toLowerCase(Locale.ROOT);
         boolean explicitHasChadGpt = lower.contains("chadgpt");
         boolean explicitHasSilent  = explicitHasChadGpt && lower.contains("silent");
+        boolean explicitHasOre     = explicitHasChadGpt && lower.contains("ore");
 
         boolean followupYou = !explicitHasChadGpt
                 && followWindowRemaining > 0
@@ -119,7 +120,22 @@ public class ChadGptMod {
             List<ChatLine> context = snapshotPrevious(HISTORY_TO_SEND);
             String latestUserMessage = raw; // send the exact player message
 
-            if (explicitHasSilent) {
+            // Priority: ore database > silent gear > regular
+            if (explicitHasOre) {
+                // Ore database search; Responses API with file_search; /tellraw output.
+                POOL.submit(() -> {
+                    String cmdFromModel = responsesWithOreFileSearch(context, latestUserMessage);
+                    List<String> cmds = buildTellrawCommandsWithIdentifier(cmdFromModel);
+                    server.execute(() -> {
+                        for (String c : cmds) {
+                            server.getCommands().performCommand(server.createCommandSourceStack(), c);
+                            LOG.info("[ChadGPT out] " + extractPlainTextFromCommand(c));
+                        }
+                        // Start a new two-message follow-up window after the final response is sent.
+                        followWindowRemaining = 2;
+                    });
+                });
+            } else if (explicitHasSilent) {
                 // Silent Gear assister; Responses API with file_search; /tellraw output.
                 POOL.submit(() -> {
                     String cmdFromModel = responsesWithFileSearch(context, latestUserMessage);
@@ -590,6 +606,87 @@ public class ChadGptMod {
             out.add(deepCopy(e));
         }
         return out;
+    }
+
+    // ---------------------------
+    // Ore route; Responses API plus file_search tool with dedicated vector store id from ENV.
+    // Request body includes only: model; instructions; input; tools.
+    // ---------------------------
+    private String responsesWithOreFileSearch(List<ChatLine> previous, String latestUserMessage) {
+        String apiKey = System.getenv(API_KEY_ENV);
+        if (apiKey == null || apiKey.isEmpty()) {
+            return fallbackTellraw("Set the " + API_KEY_ENV + " environment variable for ChadGPT.");
+        }
+
+        // Vector store id for ore DB from environment variable.
+        String vectorStoreId = System.getenv("CHADGPT_ORE_VECTOR_STORE_ID");
+        if (vectorStoreId == null || vectorStoreId.trim().isEmpty()) {
+            return fallbackTellraw("Set CHADGPT_ORE_VECTOR_STORE_ID for Ore file search.");
+        }
+
+        String instructions =
+                // Data-focused guardrails.
+                "You are ChadGPT; a minecraft player assisting other players on a server. The players in this minecraft server do not have access to your knowledgebase files or other in-game files. Do not expose the existence of those files. " +
+                "You are an in-game assistant; everything is in one continuous text string; no markdown; no literal newlines. " +
+                "Limit your response to 200 words. Answer strictly using the attached JSON data files related to ores, such as ore_height_ranges.json (fields: dimension, ore, minY, maxY). " +
+                "Use recent player chat for context but always respond to the last message. If a specific ore or dimension is mentioned, filter to those entries; otherwise summarize key ranges succinctly.\n" +
+                // Tellraw policy and theming.
+                "You format messages for Minecraft Java 1.16.5 using /tellraw.\n" +
+                "Output policy:\n" +
+                "- Emit exactly one physical line per response; no literal newlines; no commentary; no code fences.\n" +
+                "- Command shape must be: /tellraw @a <Component>\n" +
+                "- Use Raw JSON Text; not SNBT; not Bedrock rawtext; not section symbol codes.\n" +
+                "- Only these keys are allowed on objects: \"text\", \"color\", \"bold\", \"italic\".\n" +
+                "- To compose multiple segments, use a top-level JSON array of components.\n" +
+                "- For visual line breaks, include the literal string \"\\n\" as an array element or inside a \"text\" string.\n" +
+                "- Never invent other keys; never use hoverEvent; clickEvent; extra; score; selector; translate; nbt.\n" +
+                "Colors:\n" +
+                "- Allowed color names for \"color\" plus their canonical hex equivalents: black #000000; dark_blue #0000AA; dark_green #00AA00; dark_aqua #00AAAA; dark_red #AA0000; dark_purple #AA00AA; gold #FFAA00; gray #AAAAAA; dark_gray #555555; blue #5555FF; green #55FF55; aqua #55FFFF; red #FF5555; light_purple #FF55FF; yellow #FFFF55; white #FFFFFF.\n" +
+                "- You may also use 6-digit hex strings like \"#00ff88\".\n" +
+                "Formatting rules:\n" +
+                "- Bold: \"bold\": true; Italic: \"italic\": true. You may combine them. Colors apply per segment.\n" +
+                "Required output format:\n" +
+                "- Return only the finished /tellraw command as one single line of JSON; do not wrap it in quotes or fences; no leading or trailing spaces.\n" +
+                "Color segments based on the ore or dimension theme (e.g., emerald-like tones for emerald topics).";
+
+        // Build input with context then the latest message.
+        StringBuilder in = new StringBuilder();
+        if (!previous.isEmpty()) {
+            in.append("Recent chat context:\n");
+            for (ChatLine c : previous) {
+                in.append(c.author).append(": ").append(c.text).append("\n");
+            }
+        }
+        in.append(latestUserMessage);
+        String input = in.toString();
+
+        try {
+            JsonObject body = new JsonObject();
+            body.addProperty("model", MODEL);
+            body.addProperty("instructions", instructions);
+            body.addProperty("input", input);
+
+            // Tools: file_search with ore vector store id.
+            JsonArray tools = new JsonArray();
+            JsonObject tool = new JsonObject();
+            tool.addProperty("type", "file_search");
+            JsonArray vsIds = new JsonArray();
+            vsIds.add(vectorStoreId.trim());
+            tool.add("vector_store_ids", vsIds);
+            tools.add(tool);
+            body.add("tools", tools);
+
+            byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
+            String resp = httpPostResponses(payload, apiKey);
+            if (resp == null) return fallbackTellraw("The muse is muted; check server logs.");
+            String out = extractResponsesOutputText(resp);
+            return out == null || out.isEmpty()
+                    ? fallbackTellraw("Silence. Try again.")
+                    : out;
+        } catch (Exception ex) {
+            LOG.warn("OpenAI Responses call failed", ex);
+            return fallbackTellraw("Network gremlins; try again soon.");
+        }
     }
 
     // Gson's JsonElement#deepCopy is not public in many versions; provide our own.

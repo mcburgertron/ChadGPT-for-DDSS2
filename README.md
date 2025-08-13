@@ -4,10 +4,13 @@ Helper mod for a Forge 1.16.5 server; chat-triggered assistant that replies with
 
 ## What it does
 
-When any player's chat message contains `chadgpt` in any case, the mod sends context to OpenAI then makes the server say exactly one line via `tellraw @a .`. There are two routes that never collide.
+When any player's chat message contains `chadgpt` in any case, the mod sends context to OpenAI then makes the server say exactly one line via `tellraw @a .`. There are three routes evaluated in priority order.
 
 * **Regular ChadGPT**; if the message contains `chadgpt` but not `silent`.
   Uses the OpenAI **Responses API** with only `model`, `instructions`, and `input`. The instructions include a strict `/tellraw` policy; the model returns a single finished `/tellraw @a [...]` command; the server executes it.
+
+* **ChadGPT; Ore database**; if the message contains both `chadgpt` and `ore`.
+  Uses the OpenAI **Responses API** with `model`, `instructions`, `input`, and `tools:[{type:"file_search", vector_store_ids:[.]}]`. The vector store id comes from an environment variable. Intended for queries like ore height ranges using files such as `ore_height_ranges.json`.
 
 * **ChadGPT; Silent Gear assister**; if the message contains both `chadgpt` and `silent`.
   Uses the OpenAI **Responses API** with `model`, `instructions`, `input`, and `tools:[{type:"file_search", vector_store_ids:[.]}]`. The vector store id comes from an environment variable. The server executes the single returned `/tellraw` line.
@@ -42,6 +45,8 @@ If the model ever returns something that is not a valid `/tellraw @a .` line, th
    $env:OPENAI_API_KEY = 'sk-your-key'
    # Required for the Silent Gear route
    $env:CHADGPT_VECTOR_STORE_ID = 'vs_...'
+   # Required for the Ore database route
+   $env:CHADGPT_ORE_VECTOR_STORE_ID = 'vs_...'
    ```
 3. Start the server with Java 8u462 or newer Java 8 build:
 
@@ -99,6 +104,14 @@ Build command:
 
   The server executes exactly one `tellraw @a [...]` with facts sourced through your vector store.
 
+* Ore database route:
+
+  ```
+  <Player> chadgpt where does ore emerald spawn best
+  ```
+
+  The server executes exactly one `tellraw @a [...]` with facts sourced through your ore vector store (e.g., `ore_height_ranges.json`).
+
 ## Configuration at launch
 
 All via Java system properties; add them after the `java` command and before `-jar`.
@@ -129,6 +142,7 @@ Example launch with tuning:
 ```powershell
 $env:OPENAI_API_KEY = 'sk-your-key'
 $env:CHADGPT_VECTOR_STORE_ID = 'vs_689926f2f0608191b014742e99e012c5'
+$env:CHADGPT_ORE_VECTOR_STORE_ID = 'vs_db_for_ore_height_ranges'
 
 & 'D:\OpenJDK8U-jdk_x64_windows_hotspot_8u462b08\jdk8u462-b08\bin\java.exe' `
   -Dchadgpt.model=gpt-5-nano `
@@ -141,7 +155,8 @@ $env:CHADGPT_VECTOR_STORE_ID = 'vs_689926f2f0608191b014742e99e012c5'
 ## How routing works
 
 * The mod lowercases every chat line and checks for `chadgpt`.
-* If it also finds `silent` in the same line, the Silent Gear route runs.
+* If it also finds `ore` in the same line, the Ore route runs.
+* Else if it finds `silent` in the same line, the Silent Gear route runs.
 * Otherwise the regular route runs.
 * A single shared cooldown prevents double fire per line.
 
@@ -155,6 +170,7 @@ $env:CHADGPT_VECTOR_STORE_ID = 'vs_689926f2f0608191b014742e99e012c5'
 
 * **Nothing happens**; check cooldown; check that the line actually contains `chadgpt`.
 * **Silent Gear route does not answer**; verify `CHADGPT_VECTOR_STORE_ID` is set in the same shell.
+* **Ore route does not answer**; verify `CHADGPT_ORE_VECTOR_STORE_ID` is set and points to a vector store containing your ore files (e.g., `ore_height_ranges.json`).
 * **Timeouts or frequent disconnects**; raise `-Dchadgpt.responses_read_ms` and consider `-Dchadgpt.http_retries=3`.
 * **Server shows error fallback lines**; the model returned something that was not a single `/tellraw @a .` command; adjust the prompt or ask again.
 * **TLS or HTTP errors on Java 8**; use an updated 1.8 build such as 8u462 for better TLS.
