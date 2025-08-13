@@ -588,7 +588,8 @@ public class ChadGptMod {
 
         for (JsonElement e : line) {
             out.add(deepCopy(e));
-
+        }
+        return out;
     }
 
     // Gson's JsonElement#deepCopy is not public in many versions; provide our own.
@@ -615,12 +616,10 @@ public class ChadGptMod {
         // JsonObject
         JsonObject inObj = element.getAsJsonObject();
         JsonObject outObj = new JsonObject();
-        for (var entry : inObj.entrySet()) {
+        for (java.util.Map.Entry<String, JsonElement> entry : inObj.entrySet()) {
             outObj.add(entry.getKey(), deepCopy(entry.getValue()));
         }
         return outObj;
-        }
-        return out;
     }
 
     private static String firstTextOf(JsonArray line) {
